@@ -59,7 +59,21 @@ necessarily the Git Bash PATH — export it as above.
 
 ## Firmware architecture
 
-Single binary: `firmware/src/bin/main.rs`.
+The crate is a thin binary over a support library:
+
+- `src/bin/main.rs` — boot sequence and the render loop (this is the code the
+  "Boot flow" below walks through).
+- `src/lib.rs` (`dew_firmware`) — everything reusable, split into modules:
+  - `board` — panel/framebuffer constants (`H_RES`/`V_RES`/`FB_SIZE`, DMA
+    alignment, `EXIO_*` expander bits) and `alloc_framebuffer()`.
+  - `st7701` — the `ST7701_INIT` register table and `send_init()` (the
+    bit-banged 9-bit SPI).
+  - `framebuffer` — the RGB565 `FrameBuf` `DrawTarget` and the integer-only
+    drawing primitives (`fill_rect`/`fill_disc`/`ring`/`arc_top`/`isqrt`/
+    `text_center`).
+  - `palette` — the RGB565 colour constants.
+  - `widgets` — the humidity/temperature/watering gauges and `draw_static`.
+  - `telemetry` — `telemetry()`, the (currently synthetic) sensor value source.
 
 The display is an **ST7701S over a 16-bit RGB565 parallel bus** (not SPI). Boot
 flow:
@@ -70,11 +84,43 @@ flow:
    toggle LCD reset (bit0) and hold chip-select (bit2) low for init.
 4. Send the ST7701S register init sequence over a **bit-banged 3-wire 9-bit SPI**
    (SDA=GPIO1, SCL=GPIO2).
-5. Allocate a 480×480×2 = 460,800-byte RGB565 framebuffer in PSRAM, paint it with
-   `embedded-graphics` via the `FrameBuf` `DrawTarget`.
+5. Allocate a 480×480×2 = 460,800-byte RGB565 framebuffer in PSRAM.
 6. Configure the **LCD_CAM DPI** peripheral (pins + timing) and stream the
    framebuffer to the panel by looping `dpi.send(false, buf)` + `wait()` — each
-   send emits one full frame (~58 fps); re-sent continuously for a static image.
+   send emits one full frame (~58 fps). The dashboard is drawn between frames;
+   see "Rendering" below.
+
+### Rendering & the PSRAM/DMA constraint (important, hard-won)
+
+The DPI peripheral streams the framebuffer **directly from PSRAM via DMA, with no
+bounce buffer**. Golden rule: **never write the framebuffer while its DMA is
+reading it.** Two failure modes we hit, and why:
+
+- **Double buffering (draw *while* streaming) → diagonal shear.** Rendering into
+  a second PSRAM buffer while the first is streamed makes the CPU and the display
+  DMA contend for PSRAM bandwidth; the display FIFO underruns and every scanline
+  shifts a few bytes → diagonal stripes.
+- **Single buffer, full-screen redraw *between* frames → whole-screen flicker.**
+  Stopping the stream to repaint the whole ~460 KB (~5 ms) leaves the panel
+  unfed. RGB panels have no on-glass memory, so it briefly blanks.
+
+**Working approach (current): single framebuffer + dirty-rectangle updates drawn
+between frames.** `draw_static` paints the background/labels once; each frame only
+the widget whose value changed is repainted (sub-millisecond), in the gap between
+`wait()` and the next `send()`. No contention (no shear); the gap is tiny and
+recurs at ~58 Hz, above the flicker-fusion threshold (no visible flicker).
+
+Corollary for the real UI: keep it a **mostly-static layout with small per-value
+dirty-rect updates**. `telemetry()` (in the `telemetry` module) is the seam where
+real sensor reads replace the animated placeholder sweeps.
+
+Drawing helpers: gauges (drop / thermometer / cloud) are hand-drawn into the
+RGB565 buffer with integer-only helpers (`fill_rect` / `fill_disc` / `ring` /
+`arc_top`, built on `isqrt`) because a fill-to-a-level shape needs per-row
+clipping the stock embedded-graphics primitives don't provide. Text uses
+embedded-graphics `MonoTextStyle` with **iso_8859_1** fonts (needed for the `°`
+glyph; the plain `ascii` fonts lack it). Colours are `Rgb565::new(r,g,b)` with
+`r`/`b` in 0..31 and `g` in 0..63.
 
 ### Hardware pin map (Waveshare ESP32-S3-Touch-LCD-2.1)
 
@@ -91,8 +137,15 @@ flow:
 
 ## Conventions
 
-- Keep hardware constants (pins, expander bits, init bytes) named and grouped as
-  they are in `main.rs`; the ST7701S init table mirrors Waveshare's demo values.
-- The render loop currently blocks re-sending a static frame. When adding UI or
-  concurrent Embassy tasks, move to a redraw-on-change model so sensor/control
-  tasks can run.
+- Keep hardware constants (pins, expander bits, init bytes) named and grouped in
+  their module (`board`, `st7701`); the ST7701S init table mirrors Waveshare's
+  demo values. Pin assignments passed to esp-hal builders stay inline in
+  `main.rs` (they're one-shot boot wiring, not reusable constants).
+- Follow the dirty-rect rendering pattern above for any new on-screen element:
+  add a widget draw fn in the `widgets` module that clears its own bounding box
+  and repaints, and only call it when its value changes. Don't reintroduce
+  full-screen redraws or double buffering (see the PSRAM/DMA constraint).
+- The main loop currently spins on `send()`/`wait()` (blocking) and computes
+  placeholder `telemetry()`. When adding sensor/control logic, it can move to
+  concurrent Embassy tasks that publish values, with the render loop consuming
+  them — the executor is otherwise idle.
